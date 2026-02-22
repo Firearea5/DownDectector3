@@ -145,22 +145,48 @@ async function sendAlert(channelId, isUp, website) {
   }
 }
 
+async function sendCurrentStatus(channelId, isUp, website) {
+  try {
+    const channel = await client.channels.fetch(channelId);
+    if (!channel?.isTextBased()) return;
+
+    const embed = new EmbedBuilder()
+      .setTitle("Website Status")
+      .setDescription(
+        isUp
+          ? `${website} is currently online.`
+          : `${website} is currently offline.`
+      )
+      .setColor(isUp ? 0x00ff00 : 0xff0000)
+      .setTimestamp();
+
+    await channel.send({ embeds: [embed] });
+  } catch (error) {
+    console.error("Failed to send status message:", error);
+  }
+}
+
+async function probeWebsite(website) {
+  try {
+    const response = await fetch(website);
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
 async function checkSites() {
   const settings = await all(
     "SELECT guild_id, website, channel_id FROM guild_settings"
   );
 
   for (const { guild_id: guildId, website, channel_id: channelId } of settings) {
-    let isUp = false;
-    try {
-      const response = await fetch(website);
-      isUp = response.ok;
-    } catch {
-      isUp = false;
-    }
+    const isUp = await probeWebsite(website);
 
     const previous = statusByGuild.get(guildId);
-    if (typeof previous === "boolean" && previous !== isUp) {
+    if (typeof previous === "undefined" && !isUp) {
+      await sendAlert(channelId, false, website);
+    } else if (typeof previous === "boolean" && previous !== isUp) {
       await sendAlert(channelId, isUp, website);
     }
 
@@ -219,8 +245,12 @@ client.on("interactionCreate", async (interaction) => {
     );
     statusByGuild.delete(interaction.guildId);
 
+    const isUp = await probeWebsite(website);
+    statusByGuild.set(interaction.guildId, isUp);
+    await sendCurrentStatus(channel.id, isUp, website);
+
     await interaction.reply({
-      content: `Setup complete. Monitoring ${website} and sending alerts in <#${channel.id}>.`,
+      content: `Setup complete. Monitoring ${website} and sending alerts in <#${channel.id}>. I also posted the current status there.`,
       ephemeral: true,
     });
     return;
