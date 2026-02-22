@@ -167,13 +167,14 @@ const closeIncident = async (id, reason) => run("UPDATE incidents SET closed_at 
 
 async function sendEvent(channelId, e) { try { const ch = await client.channels.fetch(channelId); if (ch?.isTextBased()) await ch.send({ embeds: [e] }); } catch (err) { console.error("event send failed", err); } }
 async function upsertLive(gid, channelId, e) {
+  let created = false;
   const prev = liveUpsertLocks.get(gid) || Promise.resolve();
   const next = prev.catch(() => {}).then(async () => {
     try {
       const ch = await client.channels.fetch(channelId); if (!ch?.isTextBased()) return;
       let mid = liveMsg.get(gid); if (!mid) { const row = await get("SELECT status_message_id FROM guild_settings WHERE guild_id = ?", [gid]); mid = row?.status_message_id || null; }
       if (mid) { try { const m = await ch.messages.fetch(mid); await m.edit({ embeds: [e] }); liveMsg.set(gid, mid); return; } catch { mid = null; } }
-      const sent = await ch.send({ embeds: [e] }); liveMsg.set(gid, sent.id); await run("UPDATE guild_settings SET status_message_id = ? WHERE guild_id = ?", [sent.id, gid]);
+      const sent = await ch.send({ embeds: [e] }); liveMsg.set(gid, sent.id); await run("UPDATE guild_settings SET status_message_id = ? WHERE guild_id = ?", [sent.id, gid]); created = true;
     } catch (err) { console.error("live upsert failed", err); }
   });
   liveUpsertLocks.set(gid, next);
@@ -182,6 +183,7 @@ async function upsertLive(gid, channelId, e) {
   } finally {
     if (liveUpsertLocks.get(gid) === next) liveUpsertLocks.delete(gid);
   }
+  return { created };
 }
 
 async function evaluate(row) {
@@ -202,8 +204,8 @@ async function evaluate(row) {
   else if (changed && s.health === "up" && s.incidentId) { await closeIncident(s.incidentId, r.reason); s.incidentId = null; }
   else if (s.incidentId) { await updateIncident(s.incidentId, r.reason); const x = await get("SELECT opened_at FROM incidents WHERE id = ?", [s.incidentId]); openAt = x?.opened_at || null; }
 
-  await upsertLive(gid, c.channel_id, embed({ c, r: { ...r, health: s.health }, mode: "live", prev, incidentOpenAt: openAt }));
-  if (changed || periodic) { await sendEvent(c.channel_id, embed({ c, r: { ...r, health: s.health }, mode: "event", prev, incidentOpenAt: openAt })); s.lastAlert = now; }
+  const live = await upsertLive(gid, c.channel_id, embed({ c, r: { ...r, health: s.health }, mode: "live", prev, incidentOpenAt: openAt }));
+  if ((changed || periodic) && !live.created) { await sendEvent(c.channel_id, embed({ c, r: { ...r, health: s.health }, mode: "event", prev, incidentOpenAt: openAt })); s.lastAlert = now; }
   s.lastCheck = now; runtime.set(gid, s); await logCheck(gid, { ...r, health: s.health });
 }
 
