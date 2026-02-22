@@ -1,684 +1,277 @@
-const {
-  ChannelType,
-  Client,
-  EmbedBuilder,
-  GatewayIntentBits,
-  PermissionFlagsBits,
-  SlashCommandBuilder,
-} = require("discord.js");
+const tls = require("tls");
+const { ChannelType, Client, EmbedBuilder, GatewayIntentBits, PermissionFlagsBits, SlashCommandBuilder } = require("discord.js");
 const sqlite3 = require("sqlite3").verbose();
 
 const TOKEN = process.env.TOKEN;
 const db = new sqlite3.Database("./settings.db");
+const LOOP_TICK_MS = 2000;
+const MAX_BODY = 3000;
+const MAINT_MSG = "This service is temperarely unavailable due to updates. The estmated waiting time will be 7 minutes. Thnak yoiu for your time: Error Code: X0UP";
+const MAINT_KEYS = ["maintenance", "temporarily unavailable", "update in progress", "updating", "service unavailable"];
+const DEF = { interval_sec: 5, timeout_ms: 10000, max_retries: 3, retry_delay_ms: 1200, failure_threshold: 2, recovery_threshold: 2, degraded_latency_ms: 2200, suppression_minutes: 15, health_path: "", expected_text: "", user_agent: "DownDetectorSmartBot/2.0", enabled: 1 };
 
-const CHECK_INTERVAL_MS = 5000;
-const REQUEST_TIMEOUT_MS = 10000;
-const MAX_RETRIES = 3;
-const RETRY_DELAY_MS = 1200;
-const FAILURE_THRESHOLD = 2;
-const SUCCESS_THRESHOLD = 2;
-const MAX_BODY_CHARS = 4000;
-
-const UPDATE_ERROR_MESSAGE =
-  "This service is temperarely unavailable due to updates. The estmated waiting time will be 7 minutes. Thnak yoiu for your time: Error Code: X0UP";
-
-const MAINTENANCE_KEYWORDS = [
-  "maintenance",
-  "temporarily unavailable",
-  "update in progress",
-  "updating",
-  "service unavailable",
-];
-
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
-});
-
-// guildId -> { health, consecutiveFailures, consecutiveSuccesses, lastResult }
-const monitorStateByGuild = new Map();
-const liveMessageIdByGuild = new Map();
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const runtime = new Map(); // guildId -> state
+const liveMsg = new Map(); // guildId -> message id
 
 db.serialize(() => {
-  db.run(`
-    CREATE TABLE IF NOT EXISTS guild_settings (
-      guild_id TEXT PRIMARY KEY,
-      website TEXT NOT NULL,
-      channel_id TEXT NOT NULL,
-      status_message_id TEXT
-    )
-  `);
-  db.run(
+  db.run(`CREATE TABLE IF NOT EXISTS guild_settings (
+    guild_id TEXT PRIMARY KEY, website TEXT NOT NULL, channel_id TEXT NOT NULL, status_message_id TEXT,
+    interval_sec INTEGER DEFAULT 5, timeout_ms INTEGER DEFAULT 10000, max_retries INTEGER DEFAULT 3, retry_delay_ms INTEGER DEFAULT 1200,
+    failure_threshold INTEGER DEFAULT 2, recovery_threshold INTEGER DEFAULT 2, degraded_latency_ms INTEGER DEFAULT 2200,
+    suppression_minutes INTEGER DEFAULT 15, health_path TEXT DEFAULT '', expected_text TEXT DEFAULT '', user_agent TEXT DEFAULT 'DownDetectorSmartBot/2.0', enabled INTEGER DEFAULT 1
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS check_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, checked_at TEXT NOT NULL, health TEXT NOT NULL,
+    http_status INTEGER, latency_ms INTEGER, reason TEXT
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS incidents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, opened_at TEXT NOT NULL, closed_at TEXT,
+    start_health TEXT NOT NULL, end_health TEXT, latest_reason TEXT
+  )`);
+  const mig = [
     "ALTER TABLE guild_settings ADD COLUMN status_message_id TEXT",
-    (err) => {
-      // Ignore duplicate-column error on existing databases.
-      if (err && !String(err.message || "").includes("duplicate column name")) {
-        console.error("Failed to add status_message_id column:", err);
-      }
-    }
-  );
+    "ALTER TABLE guild_settings ADD COLUMN interval_sec INTEGER DEFAULT 5",
+    "ALTER TABLE guild_settings ADD COLUMN timeout_ms INTEGER DEFAULT 10000",
+    "ALTER TABLE guild_settings ADD COLUMN max_retries INTEGER DEFAULT 3",
+    "ALTER TABLE guild_settings ADD COLUMN retry_delay_ms INTEGER DEFAULT 1200",
+    "ALTER TABLE guild_settings ADD COLUMN failure_threshold INTEGER DEFAULT 2",
+    "ALTER TABLE guild_settings ADD COLUMN recovery_threshold INTEGER DEFAULT 2",
+    "ALTER TABLE guild_settings ADD COLUMN degraded_latency_ms INTEGER DEFAULT 2200",
+    "ALTER TABLE guild_settings ADD COLUMN suppression_minutes INTEGER DEFAULT 15",
+    "ALTER TABLE guild_settings ADD COLUMN health_path TEXT DEFAULT ''",
+    "ALTER TABLE guild_settings ADD COLUMN expected_text TEXT DEFAULT ''",
+    "ALTER TABLE guild_settings ADD COLUMN user_agent TEXT DEFAULT 'DownDetectorSmartBot/2.0'",
+    "ALTER TABLE guild_settings ADD COLUMN enabled INTEGER DEFAULT 1",
+  ];
+  for (const s of mig) db.run(s, (e) => e && !String(e.message).includes("duplicate column name") && console.error(e.message));
 });
 
-function isAdmin(interaction) {
-  return interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
-}
+const run = (sql, p = []) => new Promise((res, rej) => db.run(sql, p, function f(e) { if (e) rej(e); else res(this); }));
+const get = (sql, p = []) => new Promise((res, rej) => db.get(sql, p, (e, r) => (e ? rej(e) : res(r))));
+const all = (sql, p = []) => new Promise((res, rej) => db.all(sql, p, (e, r) => (e ? rej(e) : res(r))));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const shrink = (s, n) => (!s ? "" : (s.length > n ? `${s.slice(0, n)}...` : s));
+const admin = (i) => i.memberPermissions?.has(PermissionFlagsBits.Administrator);
+const normUrl = (u) => new URL(/^https?:\/\//i.test(u.trim()) ? u.trim() : `https://${u.trim()}`).toString();
+const hColor = (h) => (h === "up" ? 0x2ecc71 : h === "degraded" ? 0xf39c12 : h === "maintenance" ? 0xff8c00 : 0xe74c3c);
+const hText = (h) => (h === "up" ? "Online" : h === "degraded" ? "Degraded" : h === "maintenance" ? "Maintenance" : "Offline");
+const rank = (h) => (h === "down" ? 3 : h === "maintenance" ? 2 : h === "degraded" ? 1 : 0);
+const worse = (a, b) => (rank(b) > rank(a) ? b : a);
+const cfg = (r) => ({ ...DEF, ...r, interval_sec: +r.interval_sec, timeout_ms: +r.timeout_ms, max_retries: +r.max_retries, retry_delay_ms: +r.retry_delay_ms, failure_threshold: +r.failure_threshold, recovery_threshold: +r.recovery_threshold, degraded_latency_ms: +r.degraded_latency_ms, suppression_minutes: +r.suppression_minutes, enabled: +r.enabled });
+const initState = () => ({ health: "up", fail: 0, ok: 0, last: null, lastAlert: 0, incidentId: null, lastCheck: 0 });
 
-function normalizeWebsite(input) {
-  const trimmed = input.trim();
-  const prefixed = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
-  const url = new URL(prefixed);
-  return url.toString();
-}
-
-function run(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.run(sql, params, function onRun(err) {
-      if (err) {
-        reject(err);
-        return;
-      }
-      resolve(this);
-    });
-  });
-}
-
-function get(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.get(sql, params, (err, row) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-      resolve(row);
-    });
-  });
-}
-
-function all(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.all(sql, params, (err, rows) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-      resolve(rows);
-    });
-  });
-}
-
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function shorten(text, maxLength) {
-  if (!text) return "";
-  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
-}
-
-function detectMaintenance(text) {
-  const lower = (text || "").toLowerCase();
-  return MAINTENANCE_KEYWORDS.some((keyword) => lower.includes(keyword));
-}
-
-function formatHealth(health) {
-  if (health === "up") return "Online";
-  if (health === "maintenance") return "Maintenance";
-  if (health === "down") return "Offline";
-  return "Unknown";
-}
-
-function healthColor(health) {
-  if (health === "up") return 0x2ecc71;
-  if (health === "maintenance") return 0xf39c12;
-  return 0xe74c3c;
-}
-
-function healthIcon(health) {
-  if (health === "up") return "✅";
-  if (health === "maintenance") return "🛠️";
-  return "🚨";
-}
-
-async function readBodySnippet(response) {
-  const contentType = (response.headers.get("content-type") || "").toLowerCase();
-  const isTextual =
-    contentType.includes("text/") ||
-    contentType.includes("application/json") ||
-    contentType.includes("application/xml");
-
-  if (!isTextual) return "";
-
-  const text = await response.text();
-  return shorten(text, MAX_BODY_CHARS);
-}
-
-function classifyResult(statusCode, bodySnippet) {
-  if (detectMaintenance(bodySnippet)) {
-    return {
-      health: "maintenance",
-      reason: "Maintenance text detected in website response",
-    };
-  }
-
-  if (statusCode >= 200 && statusCode < 400) {
-    return { health: "up", reason: "Healthy HTTP response" };
-  }
-
-  if (statusCode === 429) {
-    return { health: "down", reason: "Rate limited (HTTP 429)" };
-  }
-
-  if (statusCode >= 500) {
-    return { health: "down", reason: `Server error (HTTP ${statusCode})` };
-  }
-
-  // 4xx means the server is reachable, so keep it as online to reduce false outages.
-  return {
-    health: "up",
-    reason: `Reachable but returned HTTP ${statusCode}`,
-  };
-}
-
-async function probeWebsite(website) {
-  let lastResult = {
-    health: "down",
-    statusCode: null,
-    latencyMs: null,
-    attempts: MAX_RETRIES,
-    reason: "Unknown error",
-    errorType: "unknown",
-  };
-
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt += 1) {
-    const startedAt = Date.now();
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
-    try {
-      const response = await fetch(website, {
-        method: "GET",
-        redirect: "follow",
-        cache: "no-store",
-        signal: controller.signal,
+async function certDays(website, timeoutMs) {
+  try {
+    const u = new URL(website);
+    if (u.protocol !== "https:") return null;
+    return await new Promise((resolve) => {
+      const sock = tls.connect({ host: u.hostname, port: u.port ? +u.port : 443, servername: u.hostname, rejectUnauthorized: false }, () => {
+        const c = sock.getPeerCertificate(); sock.end();
+        if (!c?.valid_to) return resolve(null);
+        resolve(Math.floor((new Date(c.valid_to).getTime() - Date.now()) / 86400000));
       });
-      clearTimeout(timeout);
-
-      const bodySnippet = await readBodySnippet(response);
-      const classification = classifyResult(response.status, bodySnippet);
-      const latencyMs = Date.now() - startedAt;
-
-      lastResult = {
-        health: classification.health,
-        statusCode: response.status,
-        latencyMs,
-        attempts: attempt,
-        reason: classification.reason,
-        errorType: null,
-      };
-
-      if (classification.health === "up" || classification.health === "maintenance") {
-        return lastResult;
-      }
-    } catch (error) {
-      clearTimeout(timeout);
-      const latencyMs = Date.now() - startedAt;
-      const isTimeout = error?.name === "AbortError";
-      const reason = isTimeout
-        ? `Request timed out after ${REQUEST_TIMEOUT_MS}ms`
-        : error?.message || "Network error";
-
-      lastResult = {
-        health: "down",
-        statusCode: null,
-        latencyMs,
-        attempts: attempt,
-        reason,
-        errorType: isTimeout ? "timeout" : "network",
-      };
-    }
-
-    if (attempt < MAX_RETRIES) {
-      await delay(RETRY_DELAY_MS);
-    }
-  }
-
-  return lastResult;
+      sock.setTimeout(timeoutMs, () => { sock.destroy(); resolve(null); });
+      sock.on("error", () => resolve(null));
+    });
+  } catch { return null; }
 }
 
-function buildStatusEmbed({ website, result, mode, previousHealth, failureCount, successCount }) {
-  const site = new URL(website);
-  const currentHealth = result.health;
+function classify({ status, body, latency, c, cert }) {
+  if (MAINT_KEYS.some((k) => body.toLowerCase().includes(k))) return { health: "maintenance", reason: "Maintenance text detected" };
+  if (c.expected_text && !body.toLowerCase().includes(c.expected_text.toLowerCase())) return { health: "down", reason: "Expected text check failed" };
+  if (status >= 500 || status === 429) return { health: "down", reason: status === 429 ? "Rate limited (HTTP 429)" : `Server error (HTTP ${status})` };
+  if (status >= 400) return { health: "degraded", reason: `Reachable but HTTP ${status}` };
+  let health = latency >= c.degraded_latency_ms ? "degraded" : "up";
+  let reason = health === "degraded" ? `High latency (${latency}ms)` : "Healthy HTTP response";
+  if (typeof cert === "number" && cert <= 7) { health = worse(health, "degraded"); reason = `SSL certificate expires in ${cert} day(s)`; }
+  return { health, reason };
+}
 
-  let title;
-  let description;
-
-  if (mode === "setup") {
-    title = `${healthIcon(currentHealth)} Monitor Initialized`;
-    description =
-      currentHealth === "maintenance"
-        ? UPDATE_ERROR_MESSAGE
-        : "Monitoring is active. Initial health check completed.";
-  } else if (mode === "live") {
-    title = `${healthIcon(currentHealth)} Live Service Status`;
-    description =
-      currentHealth === "maintenance"
-        ? UPDATE_ERROR_MESSAGE
-        : "This embed is auto-updated on every check cycle.";
-  } else if (mode === "recovered") {
-    title = "✅ Service Recovered";
-    description =
-      previousHealth === "maintenance"
-        ? "Maintenance appears to be completed and the site is responding normally."
-        : "The monitored website is responding again.";
-  } else {
-    title =
-      currentHealth === "maintenance"
-        ? "🛠️ Maintenance Detected"
-        : "🚨 Service Outage Detected";
-    description =
-      currentHealth === "maintenance"
-        ? UPDATE_ERROR_MESSAGE
-        : "The monitored website is currently unavailable.";
+async function probe(c) {
+  const probeUrl = c.health_path ? new URL(c.health_path, c.website).toString() : c.website;
+  const cert = await certDays(c.website, c.timeout_ms);
+  let out = { health: "down", reason: "Unknown error", statusCode: null, latencyMs: null, attempts: c.max_retries, certDaysLeft: cert, probeUrl };
+  for (let i = 1; i <= c.max_retries; i += 1) {
+    const t0 = Date.now(); const ctr = new AbortController(); const to = setTimeout(() => ctr.abort(), c.timeout_ms);
+    try {
+      const r = await fetch(probeUrl, { method: "GET", cache: "no-store", redirect: "follow", headers: { "User-Agent": c.user_agent }, signal: ctr.signal });
+      clearTimeout(to);
+      const ct = (r.headers.get("content-type") || "").toLowerCase();
+      const texty = ct.includes("text/") || ct.includes("application/json") || ct.includes("application/xml");
+      const body = texty ? shrink(await r.text(), MAX_BODY) : "";
+      const latency = Date.now() - t0;
+      const k = classify({ status: r.status, body, latency, c, cert });
+      out = { health: k.health, reason: k.reason, statusCode: r.status, latencyMs: latency, attempts: i, certDaysLeft: cert, probeUrl };
+      if (k.health !== "down") return out;
+      if (r.status === 429 && i < c.max_retries) {
+        const ra = Number(r.headers.get("retry-after") || 0);
+        await sleep((Number.isFinite(ra) && ra > 0 ? ra * 1000 : c.retry_delay_ms * 2));
+      } else if (i < c.max_retries) await sleep(c.retry_delay_ms);
+    } catch (e) {
+      clearTimeout(to);
+      out = { health: "down", reason: e?.name === "AbortError" ? `Request timed out after ${c.timeout_ms}ms` : (e?.message || "Network error"), statusCode: null, latencyMs: Date.now() - t0, attempts: i, certDaysLeft: cert, probeUrl };
+      if (i < c.max_retries) await sleep(c.retry_delay_ms);
+    }
   }
+  return out;
+}
 
+function embed({ c, r, mode, prev, fail, ok, incidentOpenAt }) {
+  const desc = mode === "setup" ? "Initial smart health check completed." : mode === "live" ? "Live status (auto-updates)." : (r.health === "maintenance" ? MAINT_MSG : r.health === "down" ? "Service appears unavailable." : r.health === "degraded" ? "Service is reachable but degraded." : "Service recovered.");
   return new EmbedBuilder()
     .setAuthor({ name: "DownDetector Smart Monitor" })
-    .setTitle(title)
-    .setDescription(description)
+    .setTitle(mode === "live" ? "Live Monitor Status" : mode === "setup" ? "Monitor Initialized" : "Monitor Event")
+    .setDescription(desc)
     .addFields(
-      { name: "Website", value: website },
-      { name: "Host", value: site.host, inline: true },
-      { name: "Status", value: formatHealth(currentHealth), inline: true },
-      {
-        name: "HTTP",
-        value: result.statusCode ? String(result.statusCode) : "No response",
-        inline: true,
-      },
-      {
-        name: "Latency",
-        value: result.latencyMs ? `${result.latencyMs}ms` : "n/a",
-        inline: true,
-      },
-      {
-        name: "Attempts",
-        value: `${result.attempts}/${MAX_RETRIES}`,
-        inline: true,
-      },
-      {
-        name: "Reason",
-        value: shorten(result.reason || "No details", 1024),
-      },
-      {
-        name: "Monitor Rules",
-        value: `Checks every ${CHECK_INTERVAL_MS / 1000}s | Down threshold ${FAILURE_THRESHOLD} | Recovery threshold ${SUCCESS_THRESHOLD}`,
-      },
-      {
-        name: "Consecutive Counts",
-        value: `Failures: ${failureCount} | Successes: ${successCount}`,
-      }
+      { name: "Website", value: c.website }, { name: "Probe URL", value: r.probeUrl }, { name: "Status", value: hText(r.health), inline: true },
+      { name: "Previous", value: hText(prev || "up"), inline: true }, { name: "HTTP", value: r.statusCode ? String(r.statusCode) : "No response", inline: true },
+      { name: "Latency", value: r.latencyMs ? `${r.latencyMs}ms` : "n/a", inline: true }, { name: "Attempts", value: `${r.attempts}/${c.max_retries}`, inline: true },
+      { name: "SSL Expiry", value: typeof r.certDaysLeft === "number" ? `${r.certDaysLeft} day(s)` : "n/a", inline: true }, { name: "Reason", value: shrink(r.reason, 1024) || "n/a" },
+      { name: "Rules", value: `Interval ${c.interval_sec}s | Fail ${c.failure_threshold} | Recover ${c.recovery_threshold}` }, { name: "Counters", value: `Failures ${fail} | Successes ${ok}` },
+      { name: "Incident", value: incidentOpenAt ? `Open since ${incidentOpenAt}` : "No open incident" }
     )
-    .setColor(healthColor(currentHealth))
-    .setFooter({ text: "Automatic monitoring event" })
+    .setColor(hColor(r.health))
+    .setFooter({ text: "Admin-only monitor controls enabled" })
     .setTimestamp();
 }
 
-async function sendMonitorMessage(channelId, payload) {
+async function logCheck(gid, r) {
+  await run("INSERT INTO check_logs (guild_id, checked_at, health, http_status, latency_ms, reason) VALUES (?, ?, ?, ?, ?, ?)", [gid, new Date().toISOString(), r.health, r.statusCode, r.latencyMs, shrink(r.reason, 1000)]);
+}
+async function openIncident(gid, health, reason) { const opened = new Date().toISOString(); const x = await run("INSERT INTO incidents (guild_id, opened_at, start_health, latest_reason) VALUES (?, ?, ?, ?)", [gid, opened, health, shrink(reason, 1000)]); return { id: x.lastID, opened }; }
+const updateIncident = async (id, reason) => run("UPDATE incidents SET latest_reason = ? WHERE id = ?", [shrink(reason, 1000), id]);
+const closeIncident = async (id, reason) => run("UPDATE incidents SET closed_at = ?, end_health = 'up', latest_reason = ? WHERE id = ?", [new Date().toISOString(), shrink(reason, 1000), id]);
+
+async function sendEvent(channelId, e) { try { const ch = await client.channels.fetch(channelId); if (ch?.isTextBased()) await ch.send({ embeds: [e] }); } catch (err) { console.error("event send failed", err); } }
+async function upsertLive(gid, channelId, e) {
   try {
-    const channel = await client.channels.fetch(channelId);
-    if (!channel?.isTextBased()) return;
+    const ch = await client.channels.fetch(channelId); if (!ch?.isTextBased()) return;
+    let mid = liveMsg.get(gid); if (!mid) { const row = await get("SELECT status_message_id FROM guild_settings WHERE guild_id = ?", [gid]); mid = row?.status_message_id || null; }
+    if (mid) { try { const m = await ch.messages.fetch(mid); await m.edit({ embeds: [e] }); liveMsg.set(gid, mid); return; } catch { mid = null; } }
+    const sent = await ch.send({ embeds: [e] }); liveMsg.set(gid, sent.id); await run("UPDATE guild_settings SET status_message_id = ? WHERE guild_id = ?", [sent.id, gid]);
+  } catch (err) { console.error("live upsert failed", err); }
+}
 
-    const embed = buildStatusEmbed(payload);
-    await channel.send({ embeds: [embed] });
-  } catch (error) {
-    console.error("Failed to send monitor message:", error);
+async function evaluate(row) {
+  const c = cfg(row); const gid = c.guild_id; const s = runtime.get(gid) || initState();
+  const r = await probe(c); const prev = s.health; s.last = r;
+  if (r.health === "up") { s.fail = 0; s.ok += 1; } else { s.ok = 0; s.fail += 1; }
+  let next = prev;
+  if (prev === "up" && r.health !== "up" && s.fail >= c.failure_threshold) next = r.health;
+  if (prev !== "up" && r.health === "up" && s.ok >= c.recovery_threshold) next = "up";
+  if (prev !== "up" && r.health !== "up" && r.health !== prev) next = r.health;
+  const changed = next !== prev; s.health = next;
+  const suppressMs = c.suppression_minutes * 60000; const now = Date.now();
+  const periodic = s.health !== "up" && !changed && now - s.lastAlert >= suppressMs;
+
+  let openAt = null;
+  if (changed && s.health !== "up" && !s.incidentId) { const o = await openIncident(gid, s.health, r.reason); s.incidentId = o.id; openAt = o.opened; }
+  else if (changed && s.health === "up" && s.incidentId) { await closeIncident(s.incidentId, r.reason); s.incidentId = null; }
+  else if (s.incidentId) { await updateIncident(s.incidentId, r.reason); const x = await get("SELECT opened_at FROM incidents WHERE id = ?", [s.incidentId]); openAt = x?.opened_at || null; }
+
+  await upsertLive(gid, c.channel_id, embed({ c, r: { ...r, health: s.health }, mode: "live", prev, fail: s.fail, ok: s.ok, incidentOpenAt: openAt }));
+  if (changed || periodic) { await sendEvent(c.channel_id, embed({ c, r: { ...r, health: s.health }, mode: "event", prev, fail: s.fail, ok: s.ok, incidentOpenAt: openAt })); s.lastAlert = now; }
+  s.lastCheck = now; runtime.set(gid, s); await logCheck(gid, { ...r, health: s.health });
+}
+
+async function monitorTick() {
+  const rows = await all("SELECT * FROM guild_settings WHERE enabled = 1");
+  for (const row of rows) {
+    const c = cfg(row); const s = runtime.get(c.guild_id) || initState();
+    if (Date.now() - s.lastCheck < c.interval_sec * 1000) continue;
+    try { await evaluate(c); } catch (e) { console.error("tick failed", c.guild_id, e.message); }
   }
 }
 
-async function sendOrUpdateLiveStatus(guildId, channelId, payload) {
-  try {
-    const channel = await client.channels.fetch(channelId);
-    if (!channel?.isTextBased()) return;
-
-    const embed = buildStatusEmbed({ ...payload, mode: "live" });
-    let messageId =
-      liveMessageIdByGuild.get(guildId) ||
-      (await get("SELECT status_message_id FROM guild_settings WHERE guild_id = ?", [guildId]))
-        ?.status_message_id;
-
-    if (messageId) {
-      try {
-        const message = await channel.messages.fetch(messageId);
-        await message.edit({ embeds: [embed] });
-        liveMessageIdByGuild.set(guildId, messageId);
-        return;
-      } catch {
-        messageId = null;
-      }
-    }
-
-    const newMessage = await channel.send({ embeds: [embed] });
-    liveMessageIdByGuild.set(guildId, newMessage.id);
-    await run("UPDATE guild_settings SET status_message_id = ? WHERE guild_id = ?", [
-      newMessage.id,
-      guildId,
-    ]);
-  } catch (error) {
-    console.error("Failed to send or update live status:", error);
-  }
-}
-
-function initialState() {
-  return {
-    health: "unknown",
-    consecutiveFailures: 0,
-    consecutiveSuccesses: 0,
-    lastResult: null,
-  };
-}
-
-async function processGuildCheck({ guildId, website, channelId }) {
-  const result = await probeWebsite(website);
-  const state = monitorStateByGuild.get(guildId) || initialState();
-
-  state.lastResult = result;
-
-  if (result.health === "up") {
-    state.consecutiveFailures = 0;
-    state.consecutiveSuccesses += 1;
-
-    if (state.health === "unknown") {
-      state.health = "up";
-    } else if (state.health !== "up" && state.consecutiveSuccesses >= SUCCESS_THRESHOLD) {
-      const previousHealth = state.health;
-      state.health = "up";
-      await sendMonitorMessage(channelId, {
-        website,
-        result,
-        mode: "recovered",
-        previousHealth,
-        failureCount: state.consecutiveFailures,
-        successCount: state.consecutiveSuccesses,
-      });
-    }
-  } else {
-    state.consecutiveSuccesses = 0;
-    state.consecutiveFailures += 1;
-
-    if (state.health === "unknown") {
-      if (state.consecutiveFailures >= FAILURE_THRESHOLD) {
-        state.health = result.health;
-        await sendMonitorMessage(channelId, {
-          website,
-          result,
-          mode: "outage",
-          previousHealth: "unknown",
-          failureCount: state.consecutiveFailures,
-          successCount: state.consecutiveSuccesses,
-        });
-      }
-    } else if (state.health === "up") {
-      if (state.consecutiveFailures >= FAILURE_THRESHOLD) {
-        state.health = result.health;
-        await sendMonitorMessage(channelId, {
-          website,
-          result,
-          mode: "outage",
-          previousHealth: "up",
-          failureCount: state.consecutiveFailures,
-          successCount: state.consecutiveSuccesses,
-        });
-      }
-    } else if (state.health !== result.health && state.consecutiveFailures >= FAILURE_THRESHOLD) {
-      // Non-up state changed (e.g., down -> maintenance); post an updated outage message.
-      state.health = result.health;
-      await sendMonitorMessage(channelId, {
-        website,
-        result,
-        mode: "outage",
-        previousHealth: "down",
-        failureCount: state.consecutiveFailures,
-        successCount: state.consecutiveSuccesses,
-      });
-    }
-  }
-
-  monitorStateByGuild.set(guildId, state);
-  await sendOrUpdateLiveStatus(guildId, channelId, {
-    website,
-    result,
-    previousHealth: state.health,
-    failureCount: state.consecutiveFailures,
-    successCount: state.consecutiveSuccesses,
-  });
-}
-
-async function checkSites() {
-  const settings = await all("SELECT guild_id, website, channel_id FROM guild_settings");
-
-  for (const { guild_id: guildId, website, channel_id: channelId } of settings) {
-    await processGuildCheck({ guildId, website, channelId });
-  }
-}
-
-async function registerGuildCommands(guild) {
+async function registerGuildCommands(g) {
   const commands = [
-    new SlashCommandBuilder()
-      .setName("setup")
-      .setDescription("Configure website monitoring for this server")
-      .addStringOption((option) =>
-        option
-          .setName("website")
-          .setDescription("Website URL to monitor")
-          .setRequired(true)
-      )
-      .addChannelOption((option) =>
-        option
-          .setName("channel")
-          .setDescription("Channel for status alerts")
-          .addChannelTypes(ChannelType.GuildText)
-          .setRequired(true)
-      ),
-    new SlashCommandBuilder()
-      .setName("change-site")
-      .setDescription("Change the monitored website")
-      .addStringOption((option) =>
-        option
-          .setName("website")
-          .setDescription("New website URL to monitor")
-          .setRequired(true)
-      ),
-    new SlashCommandBuilder()
-      .setName("change-channel")
-      .setDescription("Change the alert channel")
-      .addChannelOption((option) =>
-        option
-          .setName("channel")
-          .setDescription("New channel for status alerts")
-          .addChannelTypes(ChannelType.GuildText)
-          .setRequired(true)
-      ),
-  ].map((cmd) => cmd.toJSON());
-
-  await guild.commands.set(commands);
+    new SlashCommandBuilder().setName("setup").setDescription("Configure website monitoring").addStringOption((o) => o.setName("website").setDescription("Base website URL").setRequired(true)).addChannelOption((o) => o.setName("channel").setDescription("Text channel").addChannelTypes(ChannelType.GuildText).setRequired(true)),
+    new SlashCommandBuilder().setName("change-site").setDescription("Change monitored site").addStringOption((o) => o.setName("website").setDescription("New website URL").setRequired(true)),
+    new SlashCommandBuilder().setName("change-channel").setDescription("Change monitor channel").addChannelOption((o) => o.setName("channel").setDescription("Text channel").addChannelTypes(ChannelType.GuildText).setRequired(true)),
+    new SlashCommandBuilder().setName("site-config").setDescription("Update smart monitor settings")
+      .addIntegerOption((o) => o.setName("interval_sec").setDescription("5-300").setMinValue(5).setMaxValue(300))
+      .addIntegerOption((o) => o.setName("timeout_ms").setDescription("1000-30000").setMinValue(1000).setMaxValue(30000))
+      .addIntegerOption((o) => o.setName("max_retries").setDescription("1-5").setMinValue(1).setMaxValue(5))
+      .addIntegerOption((o) => o.setName("retry_delay_ms").setDescription("200-5000").setMinValue(200).setMaxValue(5000))
+      .addIntegerOption((o) => o.setName("failure_threshold").setDescription("1-5").setMinValue(1).setMaxValue(5))
+      .addIntegerOption((o) => o.setName("recovery_threshold").setDescription("1-5").setMinValue(1).setMaxValue(5))
+      .addIntegerOption((o) => o.setName("degraded_latency_ms").setDescription("300-20000").setMinValue(300).setMaxValue(20000))
+      .addIntegerOption((o) => o.setName("suppression_minutes").setDescription("1-180").setMinValue(1).setMaxValue(180))
+      .addStringOption((o) => o.setName("health_path").setDescription("For example /health"))
+      .addStringOption((o) => o.setName("expected_text").setDescription("Required response text"))
+      .addStringOption((o) => o.setName("user_agent").setDescription("Request user-agent"))
+      .addBooleanOption((o) => o.setName("enabled").setDescription("Enable/disable monitor")),
+    new SlashCommandBuilder().setName("status").setDescription("Show current status"),
+    new SlashCommandBuilder().setName("history").setDescription("Show recent incidents").addIntegerOption((o) => o.setName("limit").setDescription("1-10").setMinValue(1).setMaxValue(10)),
+  ].map((x) => x.toJSON());
+  await g.commands.set(commands);
 }
 
-async function registerCommandsForAllGuilds() {
-  const guilds = await client.guilds.fetch();
-  await Promise.all(
-    guilds.map(async (oauthGuild) => {
-      const guild = await oauthGuild.fetch();
-      await registerGuildCommands(guild);
-    })
-  );
+async function registerAllCommands() {
+  const gs = await client.guilds.fetch();
+  await Promise.all(gs.map(async (og) => registerGuildCommands(await og.fetch())));
 }
 
-client.once("ready", async () => {
-  console.log(`Logged in as ${client.user.tag}`);
+async function getSetup(gid) { const row = await get("SELECT * FROM guild_settings WHERE guild_id = ?", [gid]); return row ? cfg(row) : null; }
+async function sendSetup(gid, c) {
+  const r = await probe(c); const s = initState(); s.health = r.health; s.last = r; s.fail = r.health === "up" ? 0 : c.failure_threshold; s.ok = r.health === "up" ? 1 : 0; s.lastCheck = Date.now(); runtime.set(gid, s);
+  await upsertLive(gid, c.channel_id, embed({ c, r, mode: "setup", prev: "up", fail: s.fail, ok: s.ok, incidentOpenAt: null }));
+}
 
-  await registerCommandsForAllGuilds();
-  setInterval(checkSites, CHECK_INTERVAL_MS);
-  await checkSites();
-});
+client.once("ready", async () => { console.log(`Logged in as ${client.user.tag}`); await registerAllCommands(); setInterval(monitorTick, LOOP_TICK_MS); await monitorTick(); });
+client.on("guildCreate", async (g) => registerGuildCommands(g));
 
-client.on("guildCreate", async (guild) => {
-  await registerGuildCommands(guild);
-});
+client.on("interactionCreate", async (i) => {
+  if (!i.isChatInputCommand() || !i.guildId) return;
+  if (!admin(i)) return i.reply({ content: "You must have Administrator permission to use monitor commands.", ephemeral: true });
 
-client.on("interactionCreate", async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-  if (!interaction.guildId) return;
-
-  if (!isAdmin(interaction)) {
-    await interaction.reply({
-      content: "You must be an Administrator to use this command.",
-      ephemeral: true,
-    });
-    return;
+  if (i.commandName === "setup") {
+    const channel = i.options.getChannel("channel", true); let website;
+    try { website = normUrl(i.options.getString("website", true)); } catch { return i.reply({ content: "Invalid website URL.", ephemeral: true }); }
+    await run(`INSERT INTO guild_settings (guild_id, website, channel_id, status_message_id, interval_sec, timeout_ms, max_retries, retry_delay_ms, failure_threshold, recovery_threshold, degraded_latency_ms, suppression_minutes, health_path, expected_text, user_agent, enabled)
+      VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(guild_id) DO UPDATE SET website = excluded.website, channel_id = excluded.channel_id, status_message_id = NULL`,
+    [i.guildId, website, channel.id, DEF.interval_sec, DEF.timeout_ms, DEF.max_retries, DEF.retry_delay_ms, DEF.failure_threshold, DEF.recovery_threshold, DEF.degraded_latency_ms, DEF.suppression_minutes, DEF.health_path, DEF.expected_text, DEF.user_agent, DEF.enabled]);
+    liveMsg.delete(i.guildId); await sendSetup(i.guildId, await getSetup(i.guildId));
+    return i.reply({ content: `Setup complete. Monitoring ${website} in <#${channel.id}>.`, ephemeral: true });
   }
 
-  if (interaction.commandName === "setup") {
-    const channel = interaction.options.getChannel("channel", true);
-    const websiteInput = interaction.options.getString("website", true);
-
-    let website;
-    try {
-      website = normalizeWebsite(websiteInput);
-    } catch {
-      await interaction.reply({
-        content: "That website URL is invalid.",
-        ephemeral: true,
-      });
-      return;
-    }
-
-    await run(
-      `
-      INSERT INTO guild_settings (guild_id, website, channel_id, status_message_id)
-      VALUES (?, ?, ?, NULL)
-      ON CONFLICT(guild_id) DO UPDATE SET
-        website = excluded.website,
-        channel_id = excluded.channel_id,
-        status_message_id = NULL
-    `,
-      [interaction.guildId, website, channel.id]
-    );
-
-    const result = await probeWebsite(website);
-    monitorStateByGuild.set(interaction.guildId, {
-      health: result.health,
-      consecutiveFailures: result.health === "up" ? 0 : FAILURE_THRESHOLD,
-      consecutiveSuccesses: result.health === "up" ? 1 : 0,
-      lastResult: result,
-    });
-
-    await sendOrUpdateLiveStatus(interaction.guildId, channel.id, {
-      website,
-      result,
-      previousHealth: "unknown",
-      failureCount: result.health === "up" ? 0 : FAILURE_THRESHOLD,
-      successCount: result.health === "up" ? 1 : 0,
-    });
-
-    await interaction.reply({
-      content: `Setup complete. Monitoring ${website} in <#${channel.id}>. Live embed updates every ${CHECK_INTERVAL_MS / 1000} seconds.`,
-      ephemeral: true,
-    });
-    return;
+  if (i.commandName === "change-site") {
+    const c = await getSetup(i.guildId); if (!c) return i.reply({ content: "Run /setup first.", ephemeral: true });
+    let website; try { website = normUrl(i.options.getString("website", true)); } catch { return i.reply({ content: "Invalid website URL.", ephemeral: true }); }
+    await run("UPDATE guild_settings SET website = ?, status_message_id = NULL WHERE guild_id = ?", [website, i.guildId]); liveMsg.delete(i.guildId);
+    await sendSetup(i.guildId, await getSetup(i.guildId)); return i.reply({ content: `Website updated to ${website}.`, ephemeral: true });
   }
 
-  if (interaction.commandName === "change-site") {
-    const existing = await get("SELECT guild_id FROM guild_settings WHERE guild_id = ?", [
-      interaction.guildId,
-    ]);
-
-    if (!existing) {
-      await interaction.reply({
-        content: "Run /setup first.",
-        ephemeral: true,
-      });
-      return;
-    }
-
-    const websiteInput = interaction.options.getString("website", true);
-    let website;
-    try {
-      website = normalizeWebsite(websiteInput);
-    } catch {
-      await interaction.reply({
-        content: "That website URL is invalid.",
-        ephemeral: true,
-      });
-      return;
-    }
-
-    await run("UPDATE guild_settings SET website = ? WHERE guild_id = ?", [
-      website,
-      interaction.guildId,
-    ]);
-
-    const result = await probeWebsite(website);
-    monitorStateByGuild.set(interaction.guildId, {
-      health: result.health,
-      consecutiveFailures: result.health === "up" ? 0 : FAILURE_THRESHOLD,
-      consecutiveSuccesses: result.health === "up" ? 1 : 0,
-      lastResult: result,
-    });
-
-    const channelRow = await get("SELECT channel_id FROM guild_settings WHERE guild_id = ?", [
-      interaction.guildId,
-    ]);
-
-    if (channelRow?.channel_id) {
-      await sendOrUpdateLiveStatus(interaction.guildId, channelRow.channel_id, {
-        website,
-        result,
-        previousHealth: "unknown",
-        failureCount: result.health === "up" ? 0 : FAILURE_THRESHOLD,
-        successCount: result.health === "up" ? 1 : 0,
-      });
-    }
-
-    await interaction.reply({
-      content: `Updated website to ${website}. Live status embed will keep auto-updating every ${CHECK_INTERVAL_MS / 1000} seconds.`,
-      ephemeral: true,
-    });
-    return;
+  if (i.commandName === "change-channel") {
+    const c = await getSetup(i.guildId); if (!c) return i.reply({ content: "Run /setup first.", ephemeral: true });
+    const channel = i.options.getChannel("channel", true);
+    await run("UPDATE guild_settings SET channel_id = ?, status_message_id = NULL WHERE guild_id = ?", [channel.id, i.guildId]); liveMsg.delete(i.guildId);
+    await sendSetup(i.guildId, await getSetup(i.guildId)); return i.reply({ content: `Channel updated to <#${channel.id}>.`, ephemeral: true });
   }
 
-  if (interaction.commandName === "change-channel") {
-    const existing = await get("SELECT guild_id, website FROM guild_settings WHERE guild_id = ?", [
-      interaction.guildId,
-    ]);
+  if (i.commandName === "site-config") {
+    const c = await getSetup(i.guildId); if (!c) return i.reply({ content: "Run /setup first.", ephemeral: true });
+    const patch = { interval_sec: i.options.getInteger("interval_sec"), timeout_ms: i.options.getInteger("timeout_ms"), max_retries: i.options.getInteger("max_retries"), retry_delay_ms: i.options.getInteger("retry_delay_ms"), failure_threshold: i.options.getInteger("failure_threshold"), recovery_threshold: i.options.getInteger("recovery_threshold"), degraded_latency_ms: i.options.getInteger("degraded_latency_ms"), suppression_minutes: i.options.getInteger("suppression_minutes"), health_path: i.options.getString("health_path"), expected_text: i.options.getString("expected_text"), user_agent: i.options.getString("user_agent"), enabled: i.options.getBoolean("enabled") };
+    const keys = Object.keys(patch).filter((k) => patch[k] !== null); if (!keys.length) return i.reply({ content: "Set at least one option.", ephemeral: true });
+    await run(`UPDATE guild_settings SET ${keys.map((k) => `${k} = ?`).join(", ")} WHERE guild_id = ?`, [...keys.map((k) => patch[k]), i.guildId]);
+    await sendSetup(i.guildId, await getSetup(i.guildId)); return i.reply({ content: "Site config updated.", ephemeral: true });
+  }
 
-    if (!existing) {
-      await interaction.reply({
-        content: "Run /setup first.",
-        ephemeral: true,
-      });
-      return;
-    }
+  if (i.commandName === "status") {
+    const c = await getSetup(i.guildId); if (!c) return i.reply({ content: "Run /setup first.", ephemeral: true });
+    const s = runtime.get(i.guildId) || initState(); const r = s.last || await probe(c);
+    return i.reply({ embeds: [embed({ c, r: { ...r, health: s.health || r.health }, mode: "event", prev: s.health || "up", fail: s.fail || 0, ok: s.ok || 0, incidentOpenAt: null })], ephemeral: true });
+  }
 
-    const channel = interaction.options.getChannel("channel", true);
-    await run("UPDATE guild_settings SET channel_id = ?, status_message_id = NULL WHERE guild_id = ?", [
-      channel.id,
-      interaction.guildId,
-    ]);
-
-    const result =
-      (monitorStateByGuild.get(interaction.guildId) || {}).lastResult ||
-      (await probeWebsite(existing.website));
-
-    await sendOrUpdateLiveStatus(interaction.guildId, channel.id, {
-      website: existing.website,
-      result,
-      previousHealth: "unknown",
-      failureCount: monitorStateByGuild.get(interaction.guildId)?.consecutiveFailures || 0,
-      successCount: monitorStateByGuild.get(interaction.guildId)?.consecutiveSuccesses || 0,
-    });
-
-    await interaction.reply({
-      content: `Updated alert channel to <#${channel.id}>. Live status embed now updates there every ${CHECK_INTERVAL_MS / 1000} seconds.`,
-      ephemeral: true,
-    });
+  if (i.commandName === "history") {
+    const c = await getSetup(i.guildId); if (!c) return i.reply({ content: "Run /setup first.", ephemeral: true });
+    const limit = i.options.getInteger("limit") || 5;
+    const rows = await all("SELECT id, opened_at, closed_at, start_health, end_health, latest_reason FROM incidents WHERE guild_id = ? ORDER BY id DESC LIMIT ?", [i.guildId, limit]);
+    if (!rows.length) return i.reply({ content: "No incidents logged yet.", ephemeral: true });
+    const lines = rows.map((r) => `#${r.id} ${r.start_health}->${r.end_health || "ongoing"} | opened ${r.opened_at} | ${r.closed_at ? `closed ${r.closed_at}` : "open"} | ${shrink(r.latest_reason || "", 100)}`);
+    return i.reply({ content: `Recent incidents:\n${lines.join("\n")}`, ephemeral: true });
   }
 });
 
