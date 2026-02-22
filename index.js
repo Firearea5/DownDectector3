@@ -166,20 +166,47 @@ const updateIncident = async (id, reason) => run("UPDATE incidents SET latest_re
 const closeIncident = async (id, reason) => run("UPDATE incidents SET closed_at = ?, end_health = 'up', latest_reason = ? WHERE id = ?", [new Date().toISOString(), shrink(reason, 1000), id]);
 
 async function sendEvent(channelId, e) { try { const ch = await client.channels.fetch(channelId); if (ch?.isTextBased()) await ch.send({ embeds: [e] }); } catch (err) { console.error("event send failed", err); } }
+function isLiveStatusMessage(m) {
+  if (!m?.author || !client.user || m.author.id !== client.user.id) return false;
+  const em = m.embeds?.[0];
+  if (!em) return false;
+  const authorName = em.author?.name || "";
+  const title = em.title || "";
+  return authorName === "DownDetector" && (title === "Live Service Status" || title === "Monitor Initialized");
+}
+
+async function cleanupLiveDuplicates(channel, keepId) {
+  try {
+    const messages = await channel.messages.fetch({ limit: 50 });
+    const dupes = messages.filter((m) => m.id !== keepId && isLiveStatusMessage(m));
+    await Promise.all(dupes.map((m) => m.delete().catch(() => null)));
+  } catch (err) {
+    console.error("live dedupe failed", err);
+  }
+}
+
 async function upsertLive(gid, channelId, e) {
   let created = false;
+  let keepId = null;
+  let ch = null;
   const prev = liveUpsertLocks.get(gid) || Promise.resolve();
   const next = prev.catch(() => {}).then(async () => {
     try {
-      const ch = await client.channels.fetch(channelId); if (!ch?.isTextBased()) return;
+      ch = await client.channels.fetch(channelId); if (!ch?.isTextBased()) return;
       let mid = liveMsg.get(gid); if (!mid) { const row = await get("SELECT status_message_id FROM guild_settings WHERE guild_id = ?", [gid]); mid = row?.status_message_id || null; }
-      if (mid) { try { const m = await ch.messages.fetch(mid); await m.edit({ embeds: [e] }); liveMsg.set(gid, mid); return; } catch { mid = null; } }
-      const sent = await ch.send({ embeds: [e] }); liveMsg.set(gid, sent.id); await run("UPDATE guild_settings SET status_message_id = ? WHERE guild_id = ?", [sent.id, gid]); created = true;
+      if (mid) {
+        try {
+          const m = await ch.messages.fetch(mid); await m.edit({ embeds: [e] }); liveMsg.set(gid, mid); keepId = mid;
+          return;
+        } catch { mid = null; }
+      }
+      const sent = await ch.send({ embeds: [e] }); liveMsg.set(gid, sent.id); await run("UPDATE guild_settings SET status_message_id = ? WHERE guild_id = ?", [sent.id, gid]); created = true; keepId = sent.id;
     } catch (err) { console.error("live upsert failed", err); }
   });
   liveUpsertLocks.set(gid, next);
   try {
     await next;
+    if (ch?.isTextBased() && keepId) await cleanupLiveDuplicates(ch, keepId);
   } finally {
     if (liveUpsertLocks.get(gid) === next) liveUpsertLocks.delete(gid);
   }
