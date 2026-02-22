@@ -54,10 +54,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const shrink = (s, n) => (!s ? "" : (s.length > n ? `${s.slice(0, n)}...` : s));
 const admin = (i) => i.memberPermissions?.has(PermissionFlagsBits.Administrator);
 const normUrl = (u) => new URL(/^https?:\/\//i.test(u.trim()) ? u.trim() : `https://${u.trim()}`).toString();
+const siteHost = (website) => {
+  try {
+    return new URL(website).hostname;
+  } catch {
+    return "Unknown";
+  }
+};
 const siteLogo = (website) => {
   try {
     const host = new URL(website).hostname;
-    return `https://www.google.com/s2/favicons?sz=128&domain=${encodeURIComponent(host)}`;
+    return `https://icons.duckduckgo.com/ip3/${encodeURIComponent(host)}.ico`;
   } catch {
     return null;
   }
@@ -126,26 +133,26 @@ async function probe(c) {
 }
 
 function embed({ c, r, mode, prev, incidentOpenAt }) {
+  const host = siteHost(c.website);
   const desc = mode === "live"
-    ? "This embed is automatically updated!"
+    ? `Tracking ${host}\nThis embed is automatically updated!`
     : mode === "setup"
-      ? "Initial health check completed."
+      ? `Monitoring started for ${host}.`
       : (r.health === "maintenance" ? MAINT_MSG : r.health === "down" ? "Service appears unavailable." : r.health === "degraded" ? "Service is reachable but degraded." : "Service recovered.");
+  const logo = siteLogo(c.website);
   const e = new EmbedBuilder()
-    .setAuthor({ name: "DownDetector" })
-    .setTitle(mode === "live" ? "Live Service Status" : mode === "setup" ? "Monitor Initialized" : "Monitor Event")
+    .setAuthor(logo ? { name: "DownDetector", iconURL: logo } : { name: "DownDetector" })
+    .setTitle(mode === "live" ? "Live Service Status" : mode === "setup" ? "Monitor Initialized" : `Service Update: ${host}`)
     .setDescription(desc)
     .addFields(
-      { name: "Website", value: c.website }, { name: "Probe URL", value: r.probeUrl }, { name: "Status", value: hText(r.health), inline: true },
-      { name: "Previous", value: hText(prev || "up"), inline: true }, { name: "HTTP", value: r.statusCode ? String(r.statusCode) : "No response", inline: true },
-      { name: "Latency", value: r.latencyMs ? `${r.latencyMs}ms` : "n/a", inline: true }, { name: "Attempts", value: `${r.attempts}/${c.max_retries}`, inline: true },
-      { name: "SSL Expiry", value: typeof r.certDaysLeft === "number" ? `${r.certDaysLeft} day(s)` : "n/a", inline: true }, { name: "Reason", value: shrink(r.reason, 1024) || "n/a" },
+      { name: "Current Status", value: hText(r.health), inline: true }, { name: "Previous Status", value: hText(prev || "up"), inline: true }, { name: "HTTP", value: r.statusCode ? String(r.statusCode) : "No response", inline: true },
+      { name: "Latency", value: r.latencyMs ? `${r.latencyMs}ms` : "n/a", inline: true }, { name: "Attempts", value: `${r.attempts}/${c.max_retries}`, inline: true }, { name: "SSL Expiry", value: typeof r.certDaysLeft === "number" ? `${r.certDaysLeft} day(s)` : "n/a", inline: true },
+      { name: "Website", value: c.website }, { name: "Probe URL", value: r.probeUrl },
+      { name: "Reason", value: shrink(r.reason, 1024) || "n/a" },
       { name: "Incident", value: incidentOpenAt ? `Open since ${incidentOpenAt}` : "No open incident" }
     )
     .setColor(hColor(r.health))
-    .setFooter({ text: "Admin-only monitor controls enabled" })
     .setTimestamp();
-  const logo = siteLogo(c.website);
   if (logo) e.setThumbnail(logo);
   return e;
 }
