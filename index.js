@@ -1,85 +1,295 @@
-const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const {
+  ChannelType,
+  Client,
+  EmbedBuilder,
+  GatewayIntentBits,
+  PermissionFlagsBits,
+  SlashCommandBuilder,
+} = require("discord.js");
+const sqlite3 = require("sqlite3").verbose();
 
 const TOKEN = process.env.TOKEN;
-const CHANNEL_ID = "1474922121447608463";
-
-const sites = [
-  "https://www.youtube.com/",
-  "https://roblox.com",
-  "https://www.twitch.tv/",
-  "https://www.facebook.com/",
-  "https://www.x.com/",
-  "https://www.instagram.com/",
-  "https://www.linkedin.com/",
-  "https://www.reddit.com/",
-  "https://www.netflix.com/",
-  "https://www.spotify.com/",
-  "https://test.com/isntevenrunning"
-];
+const db = new sqlite3.Database("./settings.db");
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
+  intents: [GatewayIntentBits.Guilds],
 });
 
-let status = {}; // track up/down state
+const statusByGuild = new Map(); // guildId -> last known up/down
 
-async function checkSites() {
-  for (const url of sites) {
-    try {
-      const response = await fetch(url);
+db.serialize(() => {
+  db.run(`
+    CREATE TABLE IF NOT EXISTS guild_settings (
+      guild_id TEXT PRIMARY KEY,
+      website TEXT NOT NULL,
+      channel_id TEXT NOT NULL
+    )
+  `);
+});
 
-      if (response.ok) {
-        if (status[url] === false) {
-          status[url] = true;
-          alertRecovered(url);
-        }
-      } else {
-        if (status[url] !== false) {
-          status[url] = false;
-          alertDown(url);
-        }
+function isAdmin(interaction) {
+  return interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
+}
+
+function normalizeWebsite(input) {
+  const trimmed = input.trim();
+  const prefixed = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  const url = new URL(prefixed);
+  return url.toString();
+}
+
+function run(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function onRun(err) {
+      if (err) {
+        reject(err);
+        return;
       }
+      resolve(this);
+    });
+  });
+}
 
-    } catch {
-      if (status[url] !== false) {
-        status[url] = false;
-        alertDown(url);
+function get(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+      if (err) {
+        reject(err);
+        return;
       }
-    }
+      resolve(row);
+    });
+  });
+}
+
+function all(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve(rows);
+    });
+  });
+}
+
+async function registerGuildCommands(guild) {
+  const commands = [
+    new SlashCommandBuilder()
+      .setName("setup")
+      .setDescription("Configure website monitoring for this server")
+      .addStringOption((option) =>
+        option
+          .setName("website")
+          .setDescription("Website URL to monitor")
+          .setRequired(true)
+      )
+      .addChannelOption((option) =>
+        option
+          .setName("channel")
+          .setDescription("Channel for status alerts")
+          .addChannelTypes(ChannelType.GuildText)
+          .setRequired(true)
+      ),
+    new SlashCommandBuilder()
+      .setName("change-site")
+      .setDescription("Change the monitored website")
+      .addStringOption((option) =>
+        option
+          .setName("website")
+          .setDescription("New website URL to monitor")
+          .setRequired(true)
+      ),
+    new SlashCommandBuilder()
+      .setName("change-channel")
+      .setDescription("Change the alert channel")
+      .addChannelOption((option) =>
+        option
+          .setName("channel")
+          .setDescription("New channel for status alerts")
+          .addChannelTypes(ChannelType.GuildText)
+          .setRequired(true)
+      ),
+  ].map((cmd) => cmd.toJSON());
+
+  await guild.commands.set(commands);
+}
+
+async function registerCommandsForAllGuilds() {
+  const guilds = await client.guilds.fetch();
+  await Promise.all(
+    guilds.map(async (oauthGuild) => {
+      const guild = await oauthGuild.fetch();
+      await registerGuildCommands(guild);
+    })
+  );
+}
+
+async function sendAlert(channelId, isUp, website) {
+  try {
+    const channel = await client.channels.fetch(channelId);
+    if (!channel?.isTextBased()) return;
+
+    const embed = new EmbedBuilder()
+      .setTitle(isUp ? "Website Recovered" : "Website Down")
+      .setDescription(
+        isUp ? `${website} is back online.` : `${website} is not responding.`
+      )
+      .setColor(isUp ? 0x00ff00 : 0xff0000)
+      .setTimestamp();
+
+    await channel.send({ embeds: [embed] });
+  } catch (error) {
+    console.error("Failed to send alert:", error);
   }
 }
 
-function alertDown(url) {
-  const channel = client.channels.cache.get(CHANNEL_ID);
-  if (!channel) return;
+async function checkSites() {
+  const settings = await all(
+    "SELECT guild_id, website, channel_id FROM guild_settings"
+  );
 
-  const embed = new EmbedBuilder()
-    .setTitle("🚨 Website Down")
-    .setDescription(`${url} is not responding.`)
-    .setColor(0xff0000)
-    .setTimestamp();
+  for (const { guild_id: guildId, website, channel_id: channelId } of settings) {
+    let isUp = false;
+    try {
+      const response = await fetch(website);
+      isUp = response.ok;
+    } catch {
+      isUp = false;
+    }
 
-  channel.send({ embeds: [embed] });
+    const previous = statusByGuild.get(guildId);
+    if (typeof previous === "boolean" && previous !== isUp) {
+      await sendAlert(channelId, isUp, website);
+    }
+
+    statusByGuild.set(guildId, isUp);
+  }
 }
 
-function alertRecovered(url) {
-  const channel = client.channels.cache.get(CHANNEL_ID);
-  if (!channel) return;
-
-  const embed = new EmbedBuilder()
-    .setTitle("✅ Website Recovered")
-    .setDescription(`${url} is back online.`)
-    .setColor(0x00ff00)
-    .setTimestamp();
-
-  channel.send({ embeds: [embed] });
-}
-
-client.once('ready', () => {
+client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
+  await registerCommandsForAllGuilds();
   setInterval(checkSites, 60000);
-  checkSites();
+  await checkSites();
+});
+
+client.on("guildCreate", async (guild) => {
+  await registerGuildCommands(guild);
+});
+
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  if (!interaction.guildId) return;
+
+  if (!isAdmin(interaction)) {
+    await interaction.reply({
+      content: "You must be an Administrator to use this command.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (interaction.commandName === "setup") {
+    const channel = interaction.options.getChannel("channel", true);
+    const websiteInput = interaction.options.getString("website", true);
+
+    let website;
+    try {
+      website = normalizeWebsite(websiteInput);
+    } catch {
+      await interaction.reply({
+        content: "That website URL is invalid.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    await run(
+      `
+      INSERT INTO guild_settings (guild_id, website, channel_id)
+      VALUES (?, ?, ?)
+      ON CONFLICT(guild_id) DO UPDATE SET
+        website = excluded.website,
+        channel_id = excluded.channel_id
+    `,
+      [interaction.guildId, website, channel.id]
+    );
+    statusByGuild.delete(interaction.guildId);
+
+    await interaction.reply({
+      content: `Setup complete. Monitoring ${website} and sending alerts in <#${channel.id}>.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (interaction.commandName === "change-site") {
+    const existing = await get(
+      "SELECT guild_id FROM guild_settings WHERE guild_id = ?",
+      [interaction.guildId]
+    );
+
+    if (!existing) {
+      await interaction.reply({
+        content: "Run /setup first.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const websiteInput = interaction.options.getString("website", true);
+    let website;
+    try {
+      website = normalizeWebsite(websiteInput);
+    } catch {
+      await interaction.reply({
+        content: "That website URL is invalid.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    await run("UPDATE guild_settings SET website = ? WHERE guild_id = ?", [
+      website,
+      interaction.guildId,
+    ]);
+    statusByGuild.delete(interaction.guildId);
+
+    await interaction.reply({
+      content: `Updated website to ${website}.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (interaction.commandName === "change-channel") {
+    const existing = await get(
+      "SELECT guild_id FROM guild_settings WHERE guild_id = ?",
+      [interaction.guildId]
+    );
+
+    if (!existing) {
+      await interaction.reply({
+        content: "Run /setup first.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const channel = interaction.options.getChannel("channel", true);
+    await run("UPDATE guild_settings SET channel_id = ? WHERE guild_id = ?", [
+      channel.id,
+      interaction.guildId,
+    ]);
+
+    await interaction.reply({
+      content: `Updated alert channel to <#${channel.id}>.`,
+      ephemeral: true,
+    });
+  }
 });
 
 client.login(TOKEN);
