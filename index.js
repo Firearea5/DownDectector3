@@ -237,7 +237,7 @@ async function registerAllCommands() {
 
 async function getSetup(gid) { const row = await get("SELECT * FROM guild_settings WHERE guild_id = ?", [gid]); return row ? cfg(row) : null; }
 async function sendSetup(gid, c) {
-  const r = await probe(c); const s = initState(); s.health = r.health; s.last = r; s.fail = r.health === "up" ? 0 : c.failure_threshold; s.lastCheck = Date.now(); runtime.set(gid, s);
+  const r = await probe(c); const s = initState(); s.health = r.health; s.last = r; s.fail = r.health === "up" ? 0 : c.failure_threshold; s.lastCheck = Date.now(); s.lastAlert = Date.now(); runtime.set(gid, s);
   await upsertLive(gid, c.channel_id, embed({ c, r, mode: "setup", prev: "up", incidentOpenAt: null }));
 }
 
