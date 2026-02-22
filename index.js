@@ -54,12 +54,20 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const shrink = (s, n) => (!s ? "" : (s.length > n ? `${s.slice(0, n)}...` : s));
 const admin = (i) => i.memberPermissions?.has(PermissionFlagsBits.Administrator);
 const normUrl = (u) => new URL(/^https?:\/\//i.test(u.trim()) ? u.trim() : `https://${u.trim()}`).toString();
+const siteLogo = (website) => {
+  try {
+    const host = new URL(website).hostname;
+    return `https://www.google.com/s2/favicons?sz=128&domain=${encodeURIComponent(host)}`;
+  } catch {
+    return null;
+  }
+};
 const hColor = (h) => (h === "up" ? 0x2ecc71 : h === "degraded" ? 0xf39c12 : h === "maintenance" ? 0xff8c00 : 0xe74c3c);
 const hText = (h) => (h === "up" ? "Online" : h === "degraded" ? "Degraded" : h === "maintenance" ? "Maintenance" : "Offline");
 const rank = (h) => (h === "down" ? 3 : h === "maintenance" ? 2 : h === "degraded" ? 1 : 0);
 const worse = (a, b) => (rank(b) > rank(a) ? b : a);
 const cfg = (r) => ({ ...DEF, ...r, interval_sec: +r.interval_sec, timeout_ms: +r.timeout_ms, max_retries: +r.max_retries, retry_delay_ms: +r.retry_delay_ms, failure_threshold: +r.failure_threshold, recovery_threshold: +r.recovery_threshold, degraded_latency_ms: +r.degraded_latency_ms, suppression_minutes: +r.suppression_minutes, enabled: +r.enabled });
-const initState = () => ({ health: "up", fail: 0, ok: 0, last: null, lastAlert: 0, incidentId: null, lastCheck: 0 });
+const initState = () => ({ health: "up", fail: 0, last: null, lastAlert: 0, incidentId: null, lastCheck: 0 });
 
 async function certDays(website, timeoutMs) {
   try {
@@ -117,23 +125,29 @@ async function probe(c) {
   return out;
 }
 
-function embed({ c, r, mode, prev, fail, ok, incidentOpenAt }) {
-  const desc = mode === "setup" ? "Initial smart health check completed." : mode === "live" ? "Live status (auto-updates)." : (r.health === "maintenance" ? MAINT_MSG : r.health === "down" ? "Service appears unavailable." : r.health === "degraded" ? "Service is reachable but degraded." : "Service recovered.");
-  return new EmbedBuilder()
-    .setAuthor({ name: "DownDetector Smart Monitor" })
-    .setTitle(mode === "live" ? "Live Monitor Status" : mode === "setup" ? "Monitor Initialized" : "Monitor Event")
+function embed({ c, r, mode, prev, incidentOpenAt }) {
+  const desc = mode === "live"
+    ? "This embed is automatically updated!"
+    : mode === "setup"
+      ? "Initial health check completed."
+      : (r.health === "maintenance" ? MAINT_MSG : r.health === "down" ? "Service appears unavailable." : r.health === "degraded" ? "Service is reachable but degraded." : "Service recovered.");
+  const e = new EmbedBuilder()
+    .setAuthor({ name: "DownDetector" })
+    .setTitle(mode === "live" ? "Live Service Status" : mode === "setup" ? "Monitor Initialized" : "Monitor Event")
     .setDescription(desc)
     .addFields(
       { name: "Website", value: c.website }, { name: "Probe URL", value: r.probeUrl }, { name: "Status", value: hText(r.health), inline: true },
       { name: "Previous", value: hText(prev || "up"), inline: true }, { name: "HTTP", value: r.statusCode ? String(r.statusCode) : "No response", inline: true },
       { name: "Latency", value: r.latencyMs ? `${r.latencyMs}ms` : "n/a", inline: true }, { name: "Attempts", value: `${r.attempts}/${c.max_retries}`, inline: true },
       { name: "SSL Expiry", value: typeof r.certDaysLeft === "number" ? `${r.certDaysLeft} day(s)` : "n/a", inline: true }, { name: "Reason", value: shrink(r.reason, 1024) || "n/a" },
-      { name: "Rules", value: `Interval ${c.interval_sec}s | Fail ${c.failure_threshold} | Recover ${c.recovery_threshold}` }, { name: "Counters", value: `Failures ${fail} | Successes ${ok}` },
       { name: "Incident", value: incidentOpenAt ? `Open since ${incidentOpenAt}` : "No open incident" }
     )
     .setColor(hColor(r.health))
     .setFooter({ text: "Admin-only monitor controls enabled" })
     .setTimestamp();
+  const logo = siteLogo(c.website);
+  if (logo) e.setThumbnail(logo);
+  return e;
 }
 
 async function logCheck(gid, r) {
@@ -156,10 +170,11 @@ async function upsertLive(gid, channelId, e) {
 async function evaluate(row) {
   const c = cfg(row); const gid = c.guild_id; const s = runtime.get(gid) || initState();
   const r = await probe(c); const prev = s.health; s.last = r;
-  if (r.health === "up") { s.fail = 0; s.ok += 1; } else { s.ok = 0; s.fail += 1; }
+  if (r.health === "up") s.fail = 0;
+  else s.fail += 1;
   let next = prev;
   if (prev === "up" && r.health !== "up" && s.fail >= c.failure_threshold) next = r.health;
-  if (prev !== "up" && r.health === "up" && s.ok >= c.recovery_threshold) next = "up";
+  if (prev !== "up" && r.health === "up") next = "up";
   if (prev !== "up" && r.health !== "up" && r.health !== prev) next = r.health;
   const changed = next !== prev; s.health = next;
   const suppressMs = c.suppression_minutes * 60000; const now = Date.now();
@@ -170,8 +185,8 @@ async function evaluate(row) {
   else if (changed && s.health === "up" && s.incidentId) { await closeIncident(s.incidentId, r.reason); s.incidentId = null; }
   else if (s.incidentId) { await updateIncident(s.incidentId, r.reason); const x = await get("SELECT opened_at FROM incidents WHERE id = ?", [s.incidentId]); openAt = x?.opened_at || null; }
 
-  await upsertLive(gid, c.channel_id, embed({ c, r: { ...r, health: s.health }, mode: "live", prev, fail: s.fail, ok: s.ok, incidentOpenAt: openAt }));
-  if (changed || periodic) { await sendEvent(c.channel_id, embed({ c, r: { ...r, health: s.health }, mode: "event", prev, fail: s.fail, ok: s.ok, incidentOpenAt: openAt })); s.lastAlert = now; }
+  await upsertLive(gid, c.channel_id, embed({ c, r: { ...r, health: s.health }, mode: "live", prev, incidentOpenAt: openAt }));
+  if (changed || periodic) { await sendEvent(c.channel_id, embed({ c, r: { ...r, health: s.health }, mode: "event", prev, incidentOpenAt: openAt })); s.lastAlert = now; }
   s.lastCheck = now; runtime.set(gid, s); await logCheck(gid, { ...r, health: s.health });
 }
 
@@ -215,8 +230,8 @@ async function registerAllCommands() {
 
 async function getSetup(gid) { const row = await get("SELECT * FROM guild_settings WHERE guild_id = ?", [gid]); return row ? cfg(row) : null; }
 async function sendSetup(gid, c) {
-  const r = await probe(c); const s = initState(); s.health = r.health; s.last = r; s.fail = r.health === "up" ? 0 : c.failure_threshold; s.ok = r.health === "up" ? 1 : 0; s.lastCheck = Date.now(); runtime.set(gid, s);
-  await upsertLive(gid, c.channel_id, embed({ c, r, mode: "setup", prev: "up", fail: s.fail, ok: s.ok, incidentOpenAt: null }));
+  const r = await probe(c); const s = initState(); s.health = r.health; s.last = r; s.fail = r.health === "up" ? 0 : c.failure_threshold; s.lastCheck = Date.now(); runtime.set(gid, s);
+  await upsertLive(gid, c.channel_id, embed({ c, r, mode: "setup", prev: "up", incidentOpenAt: null }));
 }
 
 client.once("ready", async () => { console.log(`Logged in as ${client.user.tag}`); await registerAllCommands(); setInterval(monitorTick, LOOP_TICK_MS); await monitorTick(); });
@@ -234,7 +249,22 @@ client.on("interactionCreate", async (i) => {
       ON CONFLICT(guild_id) DO UPDATE SET website = excluded.website, channel_id = excluded.channel_id, status_message_id = NULL`,
     [i.guildId, website, channel.id, DEF.interval_sec, DEF.timeout_ms, DEF.max_retries, DEF.retry_delay_ms, DEF.failure_threshold, DEF.recovery_threshold, DEF.degraded_latency_ms, DEF.suppression_minutes, DEF.health_path, DEF.expected_text, DEF.user_agent, DEF.enabled]);
     liveMsg.delete(i.guildId); await sendSetup(i.guildId, await getSetup(i.guildId));
-    return i.reply({ content: `Setup complete. Monitoring ${website} in <#${channel.id}>.`, ephemeral: true });
+    return i.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setAuthor({ name: "DownDetector" })
+          .setTitle("Setup Complete")
+          .setDescription("Monitoring has been enabled for your server.")
+          .addFields(
+            { name: "Website", value: website },
+            { name: "Channel", value: `<#${channel.id}>` },
+            { name: "Live Embed", value: "This embed is automatically updated!" }
+          )
+          .setColor(0x2ecc71)
+          .setTimestamp()
+      ],
+      ephemeral: true
+    });
   }
 
   if (i.commandName === "change-site") {
@@ -262,7 +292,7 @@ client.on("interactionCreate", async (i) => {
   if (i.commandName === "status") {
     const c = await getSetup(i.guildId); if (!c) return i.reply({ content: "Run /setup first.", ephemeral: true });
     const s = runtime.get(i.guildId) || initState(); const r = s.last || await probe(c);
-    return i.reply({ embeds: [embed({ c, r: { ...r, health: s.health || r.health }, mode: "event", prev: s.health || "up", fail: s.fail || 0, ok: s.ok || 0, incidentOpenAt: null })], ephemeral: true });
+    return i.reply({ embeds: [embed({ c, r: { ...r, health: s.health || r.health }, mode: "event", prev: s.health || "up", incidentOpenAt: null })], ephemeral: true });
   }
 
   if (i.commandName === "history") {
