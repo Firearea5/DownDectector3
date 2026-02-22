@@ -10,6 +10,8 @@ const sqlite3 = require("sqlite3").verbose();
 
 const TOKEN = process.env.TOKEN;
 const db = new sqlite3.Database("./settings.db");
+const UPDATE_ERROR_MESSAGE =
+  "This service is temperarely unavailable due to updates. The estmated waiting time will be 7 minutes. Thnak yoiu for your time: Error Code: X0UP";
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
@@ -138,7 +140,7 @@ async function sendAlert(channelId, isUp, website) {
       .setDescription(
         isUp
           ? "The monitored website is responding again."
-          : "The monitored website is not responding right now."
+          : UPDATE_ERROR_MESSAGE
       )
       .addFields(
         { name: "Website", value: website },
@@ -167,7 +169,7 @@ async function sendCurrentStatus(channelId, isUp, website) {
       .setDescription(
         isUp
           ? "Monitoring is active and the website is reachable."
-          : "Monitoring is active but the website appears offline."
+          : UPDATE_ERROR_MESSAGE
       )
       .addFields(
         { name: "Website", value: website },
