@@ -13,6 +13,7 @@ const DEF = { interval_sec: 5, timeout_ms: 10000, max_retries: 3, retry_delay_ms
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const runtime = new Map(); // guildId -> state
 const liveMsg = new Map(); // guildId -> message id
+const liveUpsertLocks = new Map(); // guildId -> promise chain
 
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS guild_settings (
@@ -166,12 +167,21 @@ const closeIncident = async (id, reason) => run("UPDATE incidents SET closed_at 
 
 async function sendEvent(channelId, e) { try { const ch = await client.channels.fetch(channelId); if (ch?.isTextBased()) await ch.send({ embeds: [e] }); } catch (err) { console.error("event send failed", err); } }
 async function upsertLive(gid, channelId, e) {
+  const prev = liveUpsertLocks.get(gid) || Promise.resolve();
+  const next = prev.catch(() => {}).then(async () => {
+    try {
+      const ch = await client.channels.fetch(channelId); if (!ch?.isTextBased()) return;
+      let mid = liveMsg.get(gid); if (!mid) { const row = await get("SELECT status_message_id FROM guild_settings WHERE guild_id = ?", [gid]); mid = row?.status_message_id || null; }
+      if (mid) { try { const m = await ch.messages.fetch(mid); await m.edit({ embeds: [e] }); liveMsg.set(gid, mid); return; } catch { mid = null; } }
+      const sent = await ch.send({ embeds: [e] }); liveMsg.set(gid, sent.id); await run("UPDATE guild_settings SET status_message_id = ? WHERE guild_id = ?", [sent.id, gid]);
+    } catch (err) { console.error("live upsert failed", err); }
+  });
+  liveUpsertLocks.set(gid, next);
   try {
-    const ch = await client.channels.fetch(channelId); if (!ch?.isTextBased()) return;
-    let mid = liveMsg.get(gid); if (!mid) { const row = await get("SELECT status_message_id FROM guild_settings WHERE guild_id = ?", [gid]); mid = row?.status_message_id || null; }
-    if (mid) { try { const m = await ch.messages.fetch(mid); await m.edit({ embeds: [e] }); liveMsg.set(gid, mid); return; } catch { mid = null; } }
-    const sent = await ch.send({ embeds: [e] }); liveMsg.set(gid, sent.id); await run("UPDATE guild_settings SET status_message_id = ? WHERE guild_id = ?", [sent.id, gid]);
-  } catch (err) { console.error("live upsert failed", err); }
+    await next;
+  } finally {
+    if (liveUpsertLocks.get(gid) === next) liveUpsertLocks.delete(gid);
+  }
 }
 
 async function evaluate(row) {
@@ -238,7 +248,7 @@ async function registerAllCommands() {
 async function getSetup(gid) { const row = await get("SELECT * FROM guild_settings WHERE guild_id = ?", [gid]); return row ? cfg(row) : null; }
 async function sendSetup(gid, c) {
   const r = await probe(c); const s = initState(); s.health = r.health; s.last = r; s.fail = r.health === "up" ? 0 : c.failure_threshold; s.lastCheck = Date.now(); s.lastAlert = Date.now(); runtime.set(gid, s);
-  await upsertLive(gid, c.channel_id, embed({ c, r, mode: "setup", prev: "up", incidentOpenAt: null }));
+  await upsertLive(gid, c.channel_id, embed({ c, r, mode: "live", prev: "up", incidentOpenAt: null }));
 }
 
 client.once("ready", async () => { console.log(`Logged in as ${client.user.tag}`); await registerAllCommands(); setInterval(monitorTick, LOOP_TICK_MS); await monitorTick(); });
