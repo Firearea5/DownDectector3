@@ -11,7 +11,7 @@ const sqlite3 = require("sqlite3").verbose();
 const TOKEN = process.env.TOKEN;
 const db = new sqlite3.Database("./settings.db");
 
-const CHECK_INTERVAL_MS = 60000;
+const CHECK_INTERVAL_MS = 5000;
 const REQUEST_TIMEOUT_MS = 10000;
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1200;
@@ -36,15 +36,26 @@ const client = new Client({
 
 // guildId -> { health, consecutiveFailures, consecutiveSuccesses, lastResult }
 const monitorStateByGuild = new Map();
+const liveMessageIdByGuild = new Map();
 
 db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS guild_settings (
       guild_id TEXT PRIMARY KEY,
       website TEXT NOT NULL,
-      channel_id TEXT NOT NULL
+      channel_id TEXT NOT NULL,
+      status_message_id TEXT
     )
   `);
+  db.run(
+    "ALTER TABLE guild_settings ADD COLUMN status_message_id TEXT",
+    (err) => {
+      // Ignore duplicate-column error on existing databases.
+      if (err && !String(err.message || "").includes("duplicate column name")) {
+        console.error("Failed to add status_message_id column:", err);
+      }
+    }
+  );
 });
 
 function isAdmin(interaction) {
@@ -246,6 +257,12 @@ function buildStatusEmbed({ website, result, mode, previousHealth, failureCount,
       currentHealth === "maintenance"
         ? UPDATE_ERROR_MESSAGE
         : "Monitoring is active. Initial health check completed.";
+  } else if (mode === "live") {
+    title = `${healthIcon(currentHealth)} Live Service Status`;
+    description =
+      currentHealth === "maintenance"
+        ? UPDATE_ERROR_MESSAGE
+        : "This embed is auto-updated on every check cycle.";
   } else if (mode === "recovered") {
     title = "✅ Service Recovered";
     description =
@@ -313,6 +330,39 @@ async function sendMonitorMessage(channelId, payload) {
     await channel.send({ embeds: [embed] });
   } catch (error) {
     console.error("Failed to send monitor message:", error);
+  }
+}
+
+async function sendOrUpdateLiveStatus(guildId, channelId, payload) {
+  try {
+    const channel = await client.channels.fetch(channelId);
+    if (!channel?.isTextBased()) return;
+
+    const embed = buildStatusEmbed({ ...payload, mode: "live" });
+    let messageId =
+      liveMessageIdByGuild.get(guildId) ||
+      (await get("SELECT status_message_id FROM guild_settings WHERE guild_id = ?", [guildId]))
+        ?.status_message_id;
+
+    if (messageId) {
+      try {
+        const message = await channel.messages.fetch(messageId);
+        await message.edit({ embeds: [embed] });
+        liveMessageIdByGuild.set(guildId, messageId);
+        return;
+      } catch {
+        messageId = null;
+      }
+    }
+
+    const newMessage = await channel.send({ embeds: [embed] });
+    liveMessageIdByGuild.set(guildId, newMessage.id);
+    await run("UPDATE guild_settings SET status_message_id = ? WHERE guild_id = ?", [
+      newMessage.id,
+      guildId,
+    ]);
+  } catch (error) {
+    console.error("Failed to send or update live status:", error);
   }
 }
 
@@ -392,6 +442,13 @@ async function processGuildCheck({ guildId, website, channelId }) {
   }
 
   monitorStateByGuild.set(guildId, state);
+  await sendOrUpdateLiveStatus(guildId, channelId, {
+    website,
+    result,
+    previousHealth: state.health,
+    failureCount: state.consecutiveFailures,
+    successCount: state.consecutiveSuccesses,
+  });
 }
 
 async function checkSites() {
@@ -495,11 +552,12 @@ client.on("interactionCreate", async (interaction) => {
 
     await run(
       `
-      INSERT INTO guild_settings (guild_id, website, channel_id)
-      VALUES (?, ?, ?)
+      INSERT INTO guild_settings (guild_id, website, channel_id, status_message_id)
+      VALUES (?, ?, ?, NULL)
       ON CONFLICT(guild_id) DO UPDATE SET
         website = excluded.website,
-        channel_id = excluded.channel_id
+        channel_id = excluded.channel_id,
+        status_message_id = NULL
     `,
       [interaction.guildId, website, channel.id]
     );
@@ -512,17 +570,16 @@ client.on("interactionCreate", async (interaction) => {
       lastResult: result,
     });
 
-    await sendMonitorMessage(channel.id, {
+    await sendOrUpdateLiveStatus(interaction.guildId, channel.id, {
       website,
       result,
-      mode: "setup",
       previousHealth: "unknown",
       failureCount: result.health === "up" ? 0 : FAILURE_THRESHOLD,
       successCount: result.health === "up" ? 1 : 0,
     });
 
     await interaction.reply({
-      content: `Setup complete. Monitoring ${website} in <#${channel.id}> with smart detection and improved alerts.`,
+      content: `Setup complete. Monitoring ${website} in <#${channel.id}>. Live embed updates every ${CHECK_INTERVAL_MS / 1000} seconds.`,
       ephemeral: true,
     });
     return;
@@ -566,16 +623,14 @@ client.on("interactionCreate", async (interaction) => {
       lastResult: result,
     });
 
-    const channelRow = await get(
-      "SELECT channel_id FROM guild_settings WHERE guild_id = ?",
-      [interaction.guildId]
-    );
+    const channelRow = await get("SELECT channel_id FROM guild_settings WHERE guild_id = ?", [
+      interaction.guildId,
+    ]);
 
     if (channelRow?.channel_id) {
-      await sendMonitorMessage(channelRow.channel_id, {
+      await sendOrUpdateLiveStatus(interaction.guildId, channelRow.channel_id, {
         website,
         result,
-        mode: "setup",
         previousHealth: "unknown",
         failureCount: result.health === "up" ? 0 : FAILURE_THRESHOLD,
         successCount: result.health === "up" ? 1 : 0,
@@ -583,7 +638,7 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     await interaction.reply({
-      content: `Updated website to ${website} and posted a fresh status check.`,
+      content: `Updated website to ${website}. Live status embed will keep auto-updating every ${CHECK_INTERVAL_MS / 1000} seconds.`,
       ephemeral: true,
     });
     return;
@@ -603,7 +658,7 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     const channel = interaction.options.getChannel("channel", true);
-    await run("UPDATE guild_settings SET channel_id = ? WHERE guild_id = ?", [
+    await run("UPDATE guild_settings SET channel_id = ?, status_message_id = NULL WHERE guild_id = ?", [
       channel.id,
       interaction.guildId,
     ]);
@@ -612,17 +667,16 @@ client.on("interactionCreate", async (interaction) => {
       (monitorStateByGuild.get(interaction.guildId) || {}).lastResult ||
       (await probeWebsite(existing.website));
 
-    await sendMonitorMessage(channel.id, {
+    await sendOrUpdateLiveStatus(interaction.guildId, channel.id, {
       website: existing.website,
       result,
-      mode: "setup",
       previousHealth: "unknown",
       failureCount: monitorStateByGuild.get(interaction.guildId)?.consecutiveFailures || 0,
       successCount: monitorStateByGuild.get(interaction.guildId)?.consecutiveSuccesses || 0,
     });
 
     await interaction.reply({
-      content: `Updated alert channel to <#${channel.id}> and posted current status there.`,
+      content: `Updated alert channel to <#${channel.id}>. Live status embed now updates there every ${CHECK_INTERVAL_MS / 1000} seconds.`,
       ephemeral: true,
     });
   }
