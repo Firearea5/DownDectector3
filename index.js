@@ -131,12 +131,22 @@ async function sendAlert(channelId, isUp, website) {
     const channel = await client.channels.fetch(channelId);
     if (!channel?.isTextBased()) return;
 
+    const site = new URL(website);
     const embed = new EmbedBuilder()
-      .setTitle(isUp ? "Website Recovered" : "Website Down")
+      .setAuthor({ name: "DownDetector Monitor" })
+      .setTitle(isUp ? "Service Recovered" : "Service Outage Detected")
       .setDescription(
-        isUp ? `${website} is back online.` : `${website} is not responding.`
+        isUp
+          ? "The monitored website is responding again."
+          : "The monitored website is not responding right now."
       )
-      .setColor(isUp ? 0x00ff00 : 0xff0000)
+      .addFields(
+        { name: "Website", value: website },
+        { name: "Host", value: site.host, inline: true },
+        { name: "Status", value: isUp ? "Online" : "Offline", inline: true }
+      )
+      .setColor(isUp ? 0x2ecc71 : 0xe74c3c)
+      .setFooter({ text: "Automatic status alert" })
       .setTimestamp();
 
     await channel.send({ embeds: [embed] });
@@ -150,14 +160,23 @@ async function sendCurrentStatus(channelId, isUp, website) {
     const channel = await client.channels.fetch(channelId);
     if (!channel?.isTextBased()) return;
 
+    const site = new URL(website);
     const embed = new EmbedBuilder()
-      .setTitle("Website Status")
+      .setAuthor({ name: "DownDetector Monitor" })
+      .setTitle("Current Website Status")
       .setDescription(
         isUp
-          ? `${website} is currently online.`
-          : `${website} is currently offline.`
+          ? "Monitoring is active and the website is reachable."
+          : "Monitoring is active but the website appears offline."
       )
-      .setColor(isUp ? 0x00ff00 : 0xff0000)
+      .addFields(
+        { name: "Website", value: website },
+        { name: "Host", value: site.host, inline: true },
+        { name: "Status", value: isUp ? "Online" : "Offline", inline: true },
+        { name: "Check Interval", value: "Every 60 seconds", inline: true }
+      )
+      .setColor(isUp ? 0x3498db : 0xf39c12)
+      .setFooter({ text: "Initial setup status message" })
       .setTimestamp();
 
     await channel.send({ embeds: [embed] });
